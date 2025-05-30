@@ -120,3 +120,111 @@
         (ok deposit-amount)
     ))
 )
+
+(define-public (submit-new-proposal (requested-amount uint) (funds-recipient principal) (proposal-description (string-utf8 256)))
+    (let (
+        (proposal-identifier (var-get total-proposals-count))
+    )
+    (begin
+        ;; Input validation
+        (asserts! (is-valid-recipient funds-recipient) ERROR-INVALID-RECIPIENT)
+        (asserts! (is-valid-description proposal-description) ERROR-INVALID-DESCRIPTION)
+        (asserts! (>= requested-amount u0) ERROR-INVALID-TRANSACTION-AMOUNT)
+        (asserts! (<= requested-amount (var-get total-treasury-balance)) ERROR-INSUFFICIENT-TREASURY-BALANCE)
+
+        ;; Process deposit
+        (try! (stx-transfer? MINIMUM-PROPOSAL-DEPOSIT tx-sender (as-contract tx-sender)))
+
+        ;; Create proposal
+        (map-set treasury-proposals proposal-identifier {
+            proposal-creator: tx-sender,
+            requested-amount: requested-amount,
+            funds-recipient: funds-recipient,
+            proposal-description: proposal-description,
+            total-yes-votes: u0,
+            total-no-votes: u0,
+            proposal-start-block: block-height,
+            proposal-executed: false,
+            proposal-deposit-amount: MINIMUM-PROPOSAL-DEPOSIT
+        })
+
+        (var-set total-proposals-count (+ proposal-identifier u1))
+        (ok proposal-identifier)
+    ))
+)
+
+(define-public (cast-vote (proposal-identifier uint) (support-proposal bool))
+    (let (
+        (proposal-data (unwrap! (get-proposal-details proposal-identifier) ERROR-PROPOSAL-NOT-EXISTING))
+    )
+    (begin
+        (asserts! (is-proposal-voting-active proposal-identifier) ERROR-PROPOSAL-VOTING-PERIOD-ENDED)
+        (asserts! (not (check-member-vote-status proposal-identifier tx-sender)) ERROR-MEMBER-ALREADY-VOTED)
+
+        (map-set member-voting-records 
+            {proposal-identifier: proposal-identifier, member-address: tx-sender} 
+            true)
+
+        (if support-proposal
+            (map-set treasury-proposals proposal-identifier 
+                (merge proposal-data {total-yes-votes: (+ (get total-yes-votes proposal-data) u1)}))
+            (map-set treasury-proposals proposal-identifier 
+                (merge proposal-data {total-no-votes: (+ (get total-no-votes proposal-data) u1)}))
+        )
+
+        (ok true)
+    ))
+)
+
+(define-public (execute-approved-proposal (proposal-identifier uint))
+    (let (
+        (proposal-data (unwrap! (get-proposal-details proposal-identifier) ERROR-PROPOSAL-NOT-EXISTING))
+    )
+    (begin
+        (asserts! (not (get proposal-executed proposal-data)) ERROR-PROPOSAL-VOTING-PERIOD-ENDED)
+        (asserts! (check-proposal-quorum-reached 
+            (get total-yes-votes proposal-data) 
+            (get total-no-votes proposal-data)) 
+            ERROR-UNAUTHORIZED-ACCESS)
+
+        ;; Execute the transfer
+        (try! (as-contract (stx-transfer? (get requested-amount proposal-data) 
+                                        tx-sender 
+                                        (get funds-recipient proposal-data))))
+
+        ;; Update treasury balance
+        (var-set total-treasury-balance 
+            (- (var-get total-treasury-balance) (get requested-amount proposal-data)))
+
+        ;; Return deposit to proposer
+        (try! (as-contract (stx-transfer? (get proposal-deposit-amount proposal-data)
+                                        tx-sender
+                                        (get proposal-creator proposal-data))))
+
+        ;; Mark proposal as executed
+        (map-set treasury-proposals proposal-identifier 
+            (merge proposal-data {proposal-executed: true}))
+
+        (ok true)
+    ))
+)
+
+;; Admin functions
+(define-public (transfer-admin-rights (new-administrator principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get treasury-administrator)) ERROR-UNAUTHORIZED-ACCESS)
+        (asserts! (not (is-eq new-administrator (as-contract tx-sender))) ERROR-INVALID-ADMIN)
+        (var-set treasury-administrator new-administrator)
+        (ok true)
+    ))
+
+;; Emergency functions
+(define-public (emergency-treasury-shutdown)
+    (begin
+        (asserts! (is-eq tx-sender (var-get treasury-administrator)) ERROR-UNAUTHORIZED-ACCESS)
+        (try! (as-contract (stx-transfer? (var-get total-treasury-balance)
+                                  tx-sender
+                                  (var-get treasury-administrator))))
+        (var-set total-treasury-balance u0)
+        (ok true)
+    ))
